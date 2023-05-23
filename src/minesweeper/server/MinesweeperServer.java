@@ -7,10 +7,14 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 
+import javax.swing.plaf.basic.BasicInternalFrameTitlePane.IconifyAction;
+
 import minesweeper.Board;
 
 /**
  * Multiplayer Minesweeper server.
+ * MinesweeperServer handle multiple connection concurrent.
+ * Concurrent request will be synchronized.
  */
 public class MinesweeperServer {
 
@@ -28,7 +32,11 @@ public class MinesweeperServer {
     private final ServerSocket serverSocket;
     /** True if the server should *not* disconnect a client after a BOOM message. */
     private final boolean debug;
-
+    /** minesweeper board to play */
+    private final Board board;
+    /** how many player online */
+    private int players = 0;
+    
     // TODO: Abstraction function, rep invariant, rep exposure
 
     /**
@@ -38,9 +46,10 @@ public class MinesweeperServer {
      * @param debug debug mode flag
      * @throws IOException if an error occurs opening the server socket
      */
-    public MinesweeperServer(int port, boolean debug) throws IOException {
+    public MinesweeperServer(Board board, int port, boolean debug) throws IOException {
         serverSocket = new ServerSocket(port);
         this.debug = debug;
+        this.board = board;
     }
 
     /**
@@ -55,14 +64,14 @@ public class MinesweeperServer {
             // block until a client connects
             Socket socket = serverSocket.accept();
 
-            // handle the client
-            try {
-                handleConnection(socket);
-            } catch (IOException ioe) {
-                ioe.printStackTrace(); // but don't terminate serve()
-            } finally {
-                socket.close();
-            }
+            new Thread(() -> {
+	            // handle the client
+	            try (socket){
+	                handleConnection(socket);
+	            } catch (IOException ioe) {
+	                ioe.printStackTrace();
+	            }
+			}).start();
         }
     }
 
@@ -75,28 +84,58 @@ public class MinesweeperServer {
     private void handleConnection(Socket socket) throws IOException {
         BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
         PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-
+        
         try {
+        	int players = incrementPlayers();
+        	out.println(String.format("Welcome to Minesweeper. Board: %d columns by %d rows. Players: %d"
+        			+ "including you. Type 'help' for help.", board.sizeX, board.sizeY, players));
+        	
             for (String line = in.readLine(); line != null; line = in.readLine()) {
-                String output = handleRequest(line);
-                if (output != null) {
+                Optional<String> output = handleRequest(line);
+                if (output.isPresent()) {
                     // TODO: Consider improving spec of handleRequest to avoid use of null
-                    out.println(output);
+                    out.println(output.get());
+                    
+                    if (!debug && output.get() == BOOM_MSG) {
+                    	socket.close();
+                    	decrementPlayers();
+                    	break;
+                    }
                 }
             }
-        } finally {
+        } catch (DisconnectException e) {
+        	socket.close();
+        	decrementPlayers();
+		} finally {
             out.close();
             in.close();
         }
     }
+    
+    /**
+     * decrement online players by one.
+     * @return current connect online players.
+     */
+    private synchronized int decrementPlayers() {
+		return --players;
+	}
+    
+    /**
+     * increment online players by one.
+     * @return current connect online players.
+     */
+    private synchronized int incrementPlayers() {
+		return ++players;
+	}
 
     /**
      * Handler for client input, performing requested operations and returning an output message.
      * 
      * @param input message from client
      * @return message to client, or null if none
+     * @throws DisconnectException indicate a user active disconnect.
      */
-    private String handleRequest(String input) {
+    private Optional<String> handleRequest(String input) throws DisconnectException {
         String regex = "(look)|(help)|(bye)|"
                      + "(dig -?\\d+ -?\\d+)|(flag -?\\d+ -?\\d+)|(deflag -?\\d+ -?\\d+)";
         if ( ! input.matches(regex)) {
@@ -107,24 +146,35 @@ public class MinesweeperServer {
         if (tokens[0].equals("look")) {
             // 'look' request
             // TODO Problem 5
+        	return Optional.of(board.toString());
         } else if (tokens[0].equals("help")) {
             // 'help' request
             // TODO Problem 5
+        	return Optional.of(HELP_MSG);
         } else if (tokens[0].equals("bye")) {
             // 'bye' request
             // TODO Problem 5
+        	throw new DisconnectException();
         } else {
             int x = Integer.parseInt(tokens[1]);
             int y = Integer.parseInt(tokens[2]);
             if (tokens[0].equals("dig")) {
                 // 'dig x y' request
                 // TODO Problem 5
+            	if (board.dig(new Board.Position(x, y))) {
+            		return Optional.of(BOOM_MSG);
+            	}
+            	return Optional.of(board.toString());
             } else if (tokens[0].equals("flag")) {
                 // 'flag x y' request
                 // TODO Problem 5
+            	board.flag(new Board.Position(x, y));
+            	return Optional.of(board.toString());
             } else if (tokens[0].equals("deflag")) {
                 // 'deflag x y' request
                 // TODO Problem 5
+            	board.deflag(new Board.Position(x, y));
+            	return Optional.of(board.toString());
             }
         }
         // TODO: Should never get here, make sure to return in each of the cases above
@@ -248,8 +298,60 @@ public class MinesweeperServer {
     public static void runMinesweeperServer(boolean debug, Optional<File> file, int sizeX, int sizeY, int port) throws IOException {
         
         // TODO: Continue implementation here in problem 4
-        
-        MinesweeperServer server = new MinesweeperServer(port, debug);
+    	Board board = file.isEmpty() ? Board.random(sizeX, sizeY) : Board.load(file.get());
+        MinesweeperServer server = new MinesweeperServer(board, port, debug);
         server.serve();
     }
+    
+    /**
+     * DisconnectException indicate a user or server active disconnection.
+     */
+    private class DisconnectException extends Exception {
+		private static final long serialVersionUID = 3115812493847404535L;
+    }
+    
+    static public final String HELP_MSG = "LOOK message\n"
+    		+ "The message type is the word “look” and there are no arguments.\n"
+    		+ "Example:\n"
+    		+ "look\n"
+    		+ "Returns a BOARD message, a string representation of the board’s state. Does not mutate anything on the server. See the section below on messages from the server to the user for the exact required format of the BOARD message.\n"
+    		+ "DIG message\n"
+    		+ "The message is the word “dig” followed by two arguments, the X and Y coordinates. The type and the two arguments are seperated by a single SPACE.\n"
+    		+ "Example:\n"
+    		+ "dig 3 10\n"
+    		+ "The dig message has the following properties:\n"
+    		+ "If either x or y is less than 0, or either x or y is equal to or greater than the board size, or square x,y is not in the untouched state, do nothing and return a BOARD message.\n"
+    		+ "If square x,y’s state is untouched , change square x,y’s state to dug.\n"
+    		+ "If square x,y contains a bomb, change it so that it contains no bomb and send a BOOM message to the user. Then, if the debug flag is missing (see Question 4), terminate the user’s connection. See again the section below for the exact required format of the BOOM message. Note: When modifying a square from containing a bomb to no longer containing a bomb, make sure that subsequent BOARD messages show updated bomb counts in the adjacent squares. After removing the bomb continue to the next step.\n"
+    		+ "If the square x,y has no neighbor squares with bombs, then for each of x,y’s untouched neighbor squares, change said square to dug and repeat this step (not the entire DIG procedure) recursively for said neighbor square unless said neighbor square was already dug before said change.\n"
+    		+ "For any DIG message where a BOOM message is not returned, return a BOARD message.\n"
+    		+ "FLAG message\n"
+    		+ "The message type is the word “flag” followed by two arguments the X and Y coordinates. The type and the two arguments are seperated by a single SPACE.\n"
+    		+ "Example:\n"
+    		+ "flag	11 8\n"
+    		+ "The flag message has the following properties:\n"
+    		+ "If x and y are both greater than or equal to 0, and less than the board size, and square x,y is in the untouched state, change it to be in the flagged state.\n"
+    		+ "Otherwise, do not mutate any state on the server.\n"
+    		+ "For any FLAG message, return a BOARD message.\n"
+    		+ "DEFLAG message\n"
+    		+ "The message type is the word “deflag” followed by two arguments the X and Y coordinates. The type and the two arguments are seperated by a single SPACE.\n"
+    		+ "Example:\n"
+    		+ "deflag 9	9\n"
+    		+ "The flag message has the following properties:\n"
+    		+ "If x and y are both greater than or equal to 0, and less than the board size, and square x,y is in the flagged state, change it to be in the untouched state.\n"
+    		+ "Otherwise, do not mutate any state on the server.\n"
+    		+ "For any DEFLAG message, return a BOARD message.\n"
+    		+ "HELP_REQ message\n"
+    		+ "The message type is the word “help” and there are no arguments.\n"
+    		+ "Example:\n"
+    		+ "help\n"
+    		+ "Returns a HELP message (see below). Does not mutate anything on the server.\n"
+    		+ "BYE message\n"
+    		+ "The message type is the word “bye” and there are no arguments.\n"
+    		+ "Example:\n"
+    		+ "bye\n"
+    		+ "Terminates the connection with this client.\r\n";
+    
+    static public final String BOOM_MSG = "BOOM!";
+    
 }
